@@ -22,6 +22,7 @@
 // Semantics follow the public Horizon kernel behavior (KConditionVariable / KAddressArbiter / KSynchronization of Atmosphère mesosphère).
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include "thread_compat.h"
+#include "dm_wait_stats.h"
 #include "ipc.h"
 #include <errno.h>
 #include <sched.h>
@@ -76,6 +77,8 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    uint64_t core_wait_ns, core_held_ns, core_nwait, core_stats_since;   // time in core_take waiting for a virtual core, time holding one, waits (core_table)
+    uint64_t core_held_prev, core_wait_prev, core_nwait_prev, cpu_prev_ns;   // the same, and the host thread's CPU time, at the last table
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
     uint64_t protect_until;       // given a core by the starvation rule: no priority preemption before this
@@ -183,6 +186,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 #define NCORE 3
 static thr_t *g_core_owner[NCORE];
 static thr_t *g_core_wait;
+static uint64_t g_core_wait_all_ns, g_core_wait_all_n;   // all guest threads' waits in core_take (holding G; dm_core_wait_stats)
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
@@ -216,6 +220,14 @@ static int eff_prio(const thr_t *o) {
 static uint64_t g_starve_grants;
 static int starved(const thr_t *w, uint64_t now) { sched_knobs(); return g_starve_on && w->cwait_ns && now - w->cwait_ns >= STARVE_NS; }
 #endif
+/* Complete waits at the grant, including BotW threads queued by wake_queue before core_take.
+   Holding G; core_since is already sampled by the scheduler, so disabled collection adds no clocks. */
+static void core_wait_complete(thr_t *t, uint64_t granted_ns) {
+    if (!t->core_stats_since) return;
+    uint64_t elapsed = granted_ns - t->core_stats_since;
+    t->core_stats_since = 0;
+    t->core_wait_ns += elapsed; t->core_nwait++; g_core_wait_all_ns += elapsed; g_core_wait_all_n++;
+}
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
 #ifdef GAME_BOTW
@@ -232,10 +244,11 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
+    if (dm_core_diag_enabled() && t->core_since) t->core_held_ns += now_ns() - t->core_since;   // core_table
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
 }
 #ifdef GAME_BOTW
@@ -306,52 +319,78 @@ static void wake_queue(thr_t *t) {
     if (!g_wake_queue_on || !cores_enabled() || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) return;   /* a free core: core_take takes it */
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; t->cwait_ns = now_ns();
+    if (dm_wait_stats_enabled()) t->core_stats_since = t->cwait_ns;
     core_kick(t);
 }
 #endif
-#ifdef GAME_BOTW
 void runtime_describe_address(uint64_t a, char *out, size_t n);
-/* Diagnostics: a thread that waited STARVE_NS for a core logs who holds the cores it may use and where they are (first 40
-   waits; also with the starvation rule off, so a run on Horizon's rules shows what keeps the cores busy). Holding G. */
+#define CORE_DIAG_NS 4000000L
+static int core_diag_on(void) { return dm_core_diag_enabled(); }
 static int g_core_reports;
-static void core_wait_report(const thr_t *w) {
-    if (g_core_reports++ >= 40) return;
-    uint64_t now = now_ns();
-    fprintf(stderr, "[threads] thread %#x (priority %d, mask %#llx) has waited %.0f ms for a core:", w->handle, w->prio, (unsigned long long)w->mask, (now - w->cwait_ns) / 1e6);
-    for (int i = 0; i < NCORE; i++) {
-        thr_t *o = g_core_owner[i]; if (!o || !core_allowed(w, i)) continue;
-        char a[96] = "?", b[96] = "?";
-        if (thread_suspend(o->mport) == KERN_SUCCESS) {
-            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-            if (thread_get_state(o->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
-                runtime_describe_address(arm_thread_state64_get_pc(st), a, sizeof a); runtime_describe_address(arm_thread_state64_get_lr(st), b, sizeof b); }
-            thread_resume(o->mport);
-        }
-        fprintf(stderr, " core %d: %#x (priority %d, effective %d, held %.0f ms) at %s <- %s;", i, o->handle, o->prio, eff_prio(o), (now - o->core_since) / 1e6, a, b);
+/* Enter/return holding G. Snapshot retained Mach ports, then drop G before suspending or formatting:
+   an owner may be in host code holding an allocator/dyld lock, or may next need the scheduler lock. */
+static void core_wait_report(thr_t *w, uint64_t since) {
+    if (g_core_reports++ >= 400) return;
+    struct { mach_port_t port; uint32_t handle; int prio; uint64_t mask, held; int svc; } owners[NCORE] = {0};
+    uint64_t now = now_ns(), mask = w->mask; uint32_t handle = w->handle; int prio = w->prio;
+    for (int i=0;i<NCORE;i++) {
+        thr_t *o = g_core_owner[i]; if (!o) continue;
+        owners[i].handle=o->handle; owners[i].prio=o->prio; owners[i].mask=o->mask;
+        owners[i].held=o->core_since ? now-o->core_since : 0; owners[i].svc=o->last_svc;
+        if (o->mport && mach_port_mod_refs(mach_task_self(), o->mport, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS) owners[i].port=o->mport;
     }
-    fprintf(stderr, "\n");
+    pthread_mutex_unlock(&G);
+    char pc[NCORE][96], lr[NCORE][96];
+    for (int i=0;i<NCORE;i++) {
+        strcpy(pc[i], "?"); strcpy(lr[i], "?"); mach_port_t port=owners[i].port;
+        if (!port) continue;
+        arm_thread_state64_t state; mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT; int ok=0;
+        if (thread_suspend(port)==KERN_SUCCESS) {
+            ok=thread_get_state(port, ARM_THREAD_STATE64, (thread_state_t)&state, &count)==KERN_SUCCESS;
+            thread_resume(port);
+        }
+        mach_port_deallocate(mach_task_self(), port);
+        if (ok) { runtime_describe_address(arm_thread_state64_get_pc(state), pc[i], sizeof pc[i]);
+                  runtime_describe_address(arm_thread_state64_get_lr(state), lr[i], sizeof lr[i]); }
+    }
+    fprintf(stderr, "[core-wait] thread %#x (priority %d, mask %#llx) waited %.1f ms:", handle, prio, (unsigned long long)mask, (now-since)/1e6);
+    for (int i=0;i<NCORE;i++) {
+        if (!owners[i].handle) { fprintf(stderr, " core %d free;", i); continue; }
+        fprintf(stderr, " core %d%s: %#x (priority %d, mask %#llx, held %.1f ms, last svc %#x) at %s <- %s;", i,
+            (mask>>i&1) ? "" : " (not in mask)", owners[i].handle, owners[i].prio, (unsigned long long)owners[i].mask,
+            owners[i].held/1e6, owners[i].svc, pc[i], lr[i]);
+    }
+    fputc('\n',stderr);
+    pthread_mutex_lock(&G);
 }
-#endif
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
     if (!cores_enabled() || t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
+    uint64_t w0 = c < 0 && dm_wait_stats_enabled() ? now_ns() : 0;
+    if (w0 && !t->core_stats_since) t->core_stats_since = w0;
 #ifdef GAME_BOTW
-    if (c >= 0) { core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
+    if (c >= 0) { core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); core_wait_complete(t, t->core_since); g_core_owner[c] = t; return; }
     if (!t->cqueued) { t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; t->cwait_ns = now_ns(); }
     int reported = 0;
     while (t->cur_core < 0) {   // kicked owners are signalled again every millisecond; otherwise look again every 20 ms (starvation, inheritance)
         struct timespec again = {0, core_kick(t) ? 1000000 : 20000000};
         pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
-        if (!reported && t->cur_core < 0 && t->cwait_ns && now_ns() - t->cwait_ns >= STARVE_NS) { core_wait_report(t); reported = 1; }
+        if (!reported && t->cur_core < 0 && t->cwait_ns && now_ns() - t->cwait_ns >= STARVE_NS) { if (core_diag_on()) core_wait_report(t, t->cwait_ns); reported = 1; }
     }
     t->cwait_ns = 0;
 #else
     if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) g_core_owner[i]->preempt = 1;
-    while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    int reported = 0;
+    while (t->cur_core < 0) {
+        if (reported || !core_diag_on()) { pthread_cond_wait(&t->cv, &G); continue; }
+        struct timespec again = {0, CORE_DIAG_NS};   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
+        pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
+        if (t->cur_core < 0 && now_ns() - w0 >= CORE_DIAG_NS) { core_wait_report(t, w0); reported = 1; }
+    }
 #endif
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
@@ -535,6 +574,52 @@ uint32_t svc_thread_main_init(void) {
 
 static _Atomic uint64_t g_main_yield_n, g_main_yield_ns;   // 只有客体主线程写；诊断行在同一线程读 | Written only by the guest main thread; the diagnostic line reads it on the same thread
 void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = g_main_yield_n; *ns = g_main_yield_ns; }
+#define CORE_TABLE_NS 10000000000ull
+static void core_table(void) {
+    static _Atomic uint64_t last;
+    if (!core_diag_on()) return;
+    uint64_t now=now_ns(), previous=atomic_load_explicit(&last,memory_order_relaxed);
+    if (previous && now-previous<CORE_TABLE_NS) return;
+    enum { ROWS=256 };
+    typedef struct { uint32_t handle; int prio, core, svc, active; uint64_t mask, held, wait, count, cpu; } row;
+    row *rows=calloc(ROWS,sizeof *rows); if (!rows) return;
+    pthread_mutex_lock(&G);
+    now=now_ns(); previous=atomic_load_explicit(&last,memory_order_relaxed);
+    if (previous && now-previous<CORE_TABLE_NS) { pthread_mutex_unlock(&G); free(rows); return; }
+    double span=previous ? (now-previous)/1e6 : 0; atomic_store_explicit(&last,now,memory_order_relaxed); int n=0, truncated=0;
+    for (thr_t *t=g_all;t;t=t->all) {
+        uint64_t held=t->core_held_ns+(t->cur_core>=0 && t->core_since ? now-t->core_since : 0);
+        uint64_t dh=held-t->core_held_prev, dw=t->core_wait_ns-t->core_wait_prev, dn=t->core_nwait-t->core_nwait_prev;
+        t->core_held_prev=held; t->core_wait_prev=t->core_wait_ns; t->core_nwait_prev=t->core_nwait;
+        uint64_t cpu=0; thread_basic_info_data_t bi; mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+        if (t->mport && thread_info(t->mport,THREAD_BASIC_INFO,(thread_info_t)&bi,&count)==KERN_SUCCESS)
+            cpu=(uint64_t)(bi.user_time.seconds+bi.system_time.seconds)*1000000000ull+(uint64_t)(bi.user_time.microseconds+bi.system_time.microseconds)*1000ull;
+        uint64_t dc=cpu>=t->cpu_prev_ns ? cpu-t->cpu_prev_ns : 0; t->cpu_prev_ns=cpu;
+        if (span && dh<50000000ull && dw<5000000ull) continue;
+        if (n==ROWS) { truncated=1; continue; }
+        rows[n++]=(row){t->handle,t->prio,t->core,t->last_svc,t->cur_core>=0,t->mask,dh,dw,dn,dc};
+    }
+    pthread_mutex_unlock(&G);
+    fprintf(stderr,"[core-table] last %.0f ms; mask: bit 0-2 = virtual cores 0-2\n",span);
+    for (int i=0;i<n;i++) { const row *r=&rows[i];
+        fprintf(stderr,"[core-table]   thread %#x priority %d mask %#llx ideal %d: held %.0f ms (%.0f%%), cpu %.0f ms (%.0f%% of held), waited %.1f ms in %llu waits, last svc %#x%s\n",
+            r->handle,r->prio,(unsigned long long)r->mask,r->core,r->held/1e6,span ? 100.0*(r->held/1e6)/span : 0,r->cpu/1e6,
+            r->held ? 100.0*r->cpu/r->held : 0,r->wait/1e6,(unsigned long long)r->count,r->svc,r->active ? " (on a core now)" : "");
+    }
+    if (truncated) fputs("[core-table] more than 256 active rows; remaining rows omitted\n",stderr);
+    free(rows);
+}
+/* For the frame TSV (hle_nvn.c @core_wait_ms / @core_wait_all_ms / @core_waits): the calling thread's and all guest
+   threads' time waiting for a virtual core, and the number of waits. Called on the presenting thread once a frame. */
+void dm_core_wait_stats(uint64_t *self_ns, uint64_t *all_ns, uint64_t *all_n) {
+    core_table();
+    *self_ns = *all_ns = *all_n = 0;
+    if (!dm_wait_stats_enabled()) return;
+    pthread_mutex_lock(&G);
+    thr_t *me = me_or_null();
+    *self_ns = me ? me->core_wait_ns : 0; *all_ns = g_core_wait_all_ns; *all_n = g_core_wait_all_n;
+    pthread_mutex_unlock(&G);
+}
 uint32_t dm_guest_work_qos(unsigned *count) {
     uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
     pthread_mutex_lock(&G);
@@ -568,17 +653,22 @@ static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = si
     default: *bad = 1; return 0;
     }
 }
+// 只唤醒有对象已触发的同步等待者（等待的句柄多于记下的 4 个时照旧全唤醒；句柄失效的也唤醒，好让它返回错误）。
+// 原先王国之泪每次触发都唤醒全部同步等待者：每个都要醒来、重新抢虚拟核（core_take，可能为此抢占别的线程）、查一遍句柄再睡回去，
+// 一次触发就是每个等待线程一次宿主线程切换，费 CPU 和电（iPhone 上尤甚）。旷野之息从 58ac238 起就这样做（它的 wake_queue 让被唤醒者立即抢核）；
+// 当时只放在 GAME_BOTW 下是为了那次提交不改王国之泪的构建，并不是王国之泪有问题。语义不变：没有触发的等待者醒来也只会再睡回去（nxnative df7badd 同理）。
+// Wake only the waiters one of whose objects is now signaled (all of them when the wait has more handles than the 4 kept; also those
+// holding a handle that is no longer valid, so they return the error). Tears of the Kingdom used to wake every synchronization waiter
+// on every signal: each woke, competed for a virtual core again (core_take, which may preempt another thread for it), re-checked its
+// handles and went back to sleep, one host thread switch per waiting thread per signal, costing CPU and power (most of all on the
+// iPhone). Breath of the Wild has done this since 58ac238 (its wake_queue makes a woken thread compete for a core at once); it was
+// kept under GAME_BOTW only so that commit left Tears of the Kingdom's build unchanged, not because of a problem there. Semantics are
+// unchanged: a waiter none of whose objects is signaled would only have gone back to sleep (nxnative df7badd does the same).
+// Holding G.
 static void wake_sync_waiters(void) {
-#ifdef GAME_BOTW
-    /* Only the waiters one of whose objects is now signaled (all of them when the wait has more handles than are kept):
-       a woken thread competes for a core at once (wake_queue), and a waiter that would only look and sleep again
-       would preempt the signalling thread for nothing. */
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next;
         if (w->wkind == 4) { int hit = w->nwh > 4, bad = 0; for (int i = 0; !hit && i < w->nwh; i++) hit = sig_obj(w->wh[i], &bad) || bad; if (hit) wake(w, -1); }
         w = n; }
-    return;
-#endif
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }
 }
 
 static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
@@ -587,6 +677,29 @@ void dm_guest_clock_advanced(void) {
     pthread_mutex_lock(&G);
     for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) pthread_cond_signal(&t->cv);
     pthread_mutex_unlock(&G);
+}
+
+// 服务层 SystemEvent 的绑定（见下面 hle_bind_system_event）：客体 SystemEventType 地址 → 它那个内核事件写端的句柄。
+// 绑定与写端句柄同生共死：CloseHandle 关掉写端时摘掉它（se_unbind），同一地址上销毁后重建的 SystemEvent 会得到新的内核事件。
+// 原先绑定永不结束：第二次绑定见到旧项直接返回，新的内核事件根本没建，触发发给已关的句柄（王国之泪的句柄编号会复用，于是发给了占了那个编号的别的事件）。
+// 例如 nfp::AttachAvailabilityChangeEvent：游戏每次用 amiibo 都可能在同一地址重建这个事件（nxnative 49ee623 同理）。锁的次序：先 G 后 g_se_lock（持 g_se_lock 时不取 G）
+// Service-layer SystemEvent bindings (see hle_bind_system_event below): guest SystemEventType address -> the handle of its kernel event's
+// write end. A binding lives as long as that handle: CloseHandle on the write end removes it (se_unbind), so a SystemEvent destroyed and
+// created again at the same address gets a new kernel event. Bindings used to stay forever: the second bind found the old entry and
+// returned, the new kernel event was never created, and signals went to the closed handle (Tears of the Kingdom reuses handle numbers,
+// so to whatever event took that number). nfp::AttachAvailabilityChangeEvent, for one, may create the event again at the same address
+// each time the game uses amiibo (nxnative 49ee623 found the same). Lock order: G, then g_se_lock (nothing takes G holding g_se_lock).
+static struct { void *ev; uint32_t wh; } g_se[512];
+static int g_nse;
+static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t se_find(void *ev) {   // 调用方持 g_se_lock | Caller holds g_se_lock
+    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
+    return 0;
+}
+static void se_unbind(uint32_t wh) {   // 调用方持 G | Caller holds G
+    pthread_mutex_lock(&g_se_lock);
+    for (int i = 0; i < g_nse; ) if (g_se[i].wh == wh) g_se[i] = g_se[--g_nse]; else i++;
+    pthread_mutex_unlock(&g_se_lock);
 }
 
 // 处理线程 / 同步类 SVC；返回 1 = 已处理
@@ -786,7 +899,9 @@ int svc_thread(int num, uint64_t *regs) {
         if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
-                if (cnt <= 0) nv = nw > 0 ? val - 1 : val + 1;
+                // 全部唤醒（个数 <= 0）且有等待者时减 2，不是减 1（mesosphère KAddressArbiter::SignalAndModifyByWaitingCountIfEqual，Ryujinx、yuzu 一致；nxnative d47f899 在 Engage 上查到）
+                // Waking all (count <= 0) with waiters subtracts 2, not 1 (mesosphère KAddressArbiter::SignalAndModifyByWaitingCountIfEqual; Ryujinx and yuzu agree; found by nxnative d47f899 in Engage)
+                if (cnt <= 0) nv = nw > 0 ? val - 2 : val + 1;
                 else nv = nw == 0 ? val + 1 : nw <= cnt ? val - 1 : val;
             }
             uint32_t e = (uint32_t)val;
@@ -854,6 +969,7 @@ int svc_thread(int num, uint64_t *regs) {
         unsigned i = (uint32_t)regs[0] - 0x1000;int valid=0;
 #endif
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
+            if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);   // 绑定随写端结束 | the binding ends with its write end
             valid=1;event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && (g_h[i].type == O_SESSION || g_h[i].type == O_TMEM)) {
@@ -881,13 +997,7 @@ int svc_thread(int num, uint64_t *regs) {
 // ---------- SystemEvent of the service layer ----------
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
-static struct { void *ev; uint32_t wh; } g_se[512];
-static int g_nse;
-static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t se_find(void *ev) {
-    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
-    return 0;
-}
+// 绑定表 g_se 在 svc_thread 之前：CloseHandle 经它解绑 | The binding table g_se sits before svc_thread: CloseHandle unbinds through it
 void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线程上调（要执行 SDK 代码） | Must be called on a guest thread (it has to execute SDK code)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (wh) return;
@@ -903,14 +1013,30 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
     pthread_mutex_unlock(&g_se_lock);
 }
-void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生） | An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
-    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
-    if (!wh) { hle_bind_system_event(ev, 0); pthread_mutex_lock(&g_se_lock); wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); }
-    pthread_mutex_lock(&G);
-    event_t *e = h_get(wh, O_EVENT_W);
-    if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
-    e->signaled = 1; wake_sync_waiters();
-    pthread_mutex_unlock(&G);
+// 未绑定的在客体线程上按手动清除即时绑定；宿主线程（显示链接的垂直同步回调等）上未绑定说明游戏已销毁了它，这次触发没有对象可发，跳过。
+// 查找与触发在同一次持 G 内完成：CloseHandle（会解绑）也在 G 下，句柄不会在两者之间被关掉、编号被别的事件占去
+// An unbound one is bound on the spot as manual-clear on a guest thread; on a host thread (the display link's vsync callback and the
+// like) unbound means the game destroyed it, and this signal has nothing to go to: skipped. The lookup and the signal happen under one
+// hold of G: CloseHandle (which unbinds) also runs under G, so the handle cannot be closed and its number taken by another event between them
+static uint64_t g_se_skipped;
+void hle_signal_system_event(void *ev) {
+    for (int bound = 0; ; bound = 1) {
+        pthread_mutex_lock(&G);
+        pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+        if (wh) {
+            event_t *e = h_get(wh, O_EVENT_W);
+            if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
+            e->signaled = 1; wake_sync_waiters();
+            pthread_mutex_unlock(&G);
+            return;
+        }
+        int guest = (g_keythr ? pthread_getspecific(g_keythr) : NULL) != NULL;
+        if (!guest && g_se_skipped++ < 8) LOG("SystemEvent %p 未绑定（游戏已销毁），宿主线程的触发跳过 | not bound (destroyed by the game): signal from a host thread skipped", ev);
+        pthread_mutex_unlock(&G);
+        if (!guest) return;
+        if (bound) die("SystemEvent %p 绑定后仍查不到 | still not bound after binding", ev);
+        hle_bind_system_event(ev, 0);   // 执行客体代码（其 SVC 要取 G）：不能持 G | runs guest code (its SVCs take G): not under G
+    }
 }
 
 // ---------- IPC support (ipc.c): sessions, transfer memory and service-owned events ----------
