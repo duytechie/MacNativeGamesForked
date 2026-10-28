@@ -2,6 +2,7 @@
 """Build Odyssey.app from your own Super Mario Odyssey 1.3.0 dump in one command.
 
     .venv/bin/python scripts/build_odyssey.py --game GAME.xci --keys prod.keys [--work Odyssey_build]
+    .venv/bin/python scripts/build_odyssey.py --game BASE.nsp --update UPDATE.nsp --keys prod.keys --firmware FOLDER
 
 Steps (each is skipped when its verified output already exists, so a failed run can simply be started again):
  1. check the input (title, version, integrity; prints no keys or game data)
@@ -62,9 +63,11 @@ def preflight(args, py):
             problems.append(f"{lib} is missing (brew install opus libvpx)")
     if not Path(args.developer_dir, "usr/bin/xcodebuild").exists():
         problems.append(f"Xcode not found at {args.developer_dir} (--developer-dir)")
-    for path in (args.game, args.keys):
+    for path in (args.game, args.keys, *([args.update] if args.update else [])):
         if not path.is_file():
             problems.append(f"{path} not found")
+    if args.update == args.game:
+        problems.append("--game and --update must be different files; omit --update for a combined package")
     if args.game.suffix.lower() == ".nsp" and not args.firmware:
         problems.append("an NSP carries no system fonts: pass --firmware <unpacked firmware NCA directory>")
     # About 12 GB in all; the merged RomFS (5.6 GB) is most of it, so a resumed build needs less.
@@ -78,7 +81,8 @@ def preflight(args, py):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--game", type=Path, required=True, help="your Odyssey XCI or NSP holding the base game and update 1.3.0")
+    p.add_argument("--game", type=Path, required=True, help="your Odyssey base XCI/NSP, or a combined base + update 1.3.0 package")
+    p.add_argument("--update", type=Path, help="separate Odyssey update 1.3.0 NSP (omit for a combined package)")
     p.add_argument("--keys", type=Path, required=True, help="prod.keys dumped from your own Switch")
     p.add_argument("--work", type=Path, default=GAME_DIR / "Odyssey_build", help="build folder (default Odyssey_build)")
     p.add_argument("--firmware", type=Path, help="unpacked firmware NCA directory, for the system fonts of an NSP build")
@@ -87,6 +91,8 @@ def main():
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 8)
     args = p.parse_args()
     args.game, args.keys, args.work = args.game.resolve(), args.keys.resolve(), args.work.resolve()
+    if args.update:
+        args.update = args.update.resolve()
     py = sys.executable
     preflight(args, py)
     work, ext = args.work, args.work / "extracted"
@@ -96,18 +102,21 @@ def main():
 
     t = step(1, "Check the input")
     run([py, "scripts/inspect_input.py", args.game, *keyargs])
+    if args.update:
+        run([py, "scripts/inspect_input.py", args.update, *keyargs])
     done(t)
 
     t = step(2, "Program modules and the merged RomFS")
     if (ext / "extraction-manifest.json").is_file():
         print("   modules already extracted")
     else:
-        run([py, "scripts/extract_code.py", args.game, *keyargs, "--output", ext])
+        run([py, "scripts/extract_code.py", args.update or args.game, *keyargs, "--output", ext])
     link(ext / "local/exefs", "..")
     if (ext / "local/romfs/index.json").is_file():
         print("   RomFS already merged")
     else:
-        run([py, "scripts/merge_romfs.py", args.game, *keyargs, "--output", ext / "local/romfs"])
+        updateargs = ["--update", args.update] if args.update else []
+        run([py, "scripts/merge_romfs.py", args.game, *updateargs, *keyargs, "--output", ext / "local/romfs"])
     done(t)
 
     t = step(3, "System fonts")
@@ -177,7 +186,7 @@ def main():
     t = step(8, "Package the app")
     icon = work / "app-assets/OdysseyIcon.jpg"
     if not icon.is_file():   # the game's own icon, from its Control data
-        run([py, "scripts/extract_app_icon.py", args.game, *keyargs, "--output", icon])
+        run([py, "scripts/extract_app_icon.py", args.update or args.game, *keyargs, "--output", icon])
     run([py, "scripts/package_native_app.py"], env={"ODYSSEY_WORK": str(work)})
     done(t)
     print(f"\nBuilt {work / 'Odyssey.app'} in {(time.monotonic() - started) / 60:.0f} min. It contains game data from your "

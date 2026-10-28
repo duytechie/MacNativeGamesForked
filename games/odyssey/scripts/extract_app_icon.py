@@ -31,14 +31,15 @@ def main():
         tickets = common_tickets(source, entries)
         controls = [(record, hdr) for record, hdr in nca_inventory(source, entries, keys)
                     if record['content_type'] == 2 and record['title_id'] == '0100000000010000']
-        require(len(controls) == 2, 'Expected base and update Control NCAs')
+        require(1 <= len(controls) <= 2, 'Expected an update Control NCA or combined base and update Control NCAs')
+        out.parent.mkdir(parents=True, exist_ok=True)
         for record, hdr in controls:
             start, end, fs = romfs_section(hdr)
             require(fs[4] == 3, 'Expected direct AES-CTR Control RomFS')
             ctr = Ctr(source, record['nca_offset'], record['size'], nca_ctr_key(hdr, keys, tickets))
             require(end <= ctr.size, 'Control RomFS exceeds stored NCA')
             upper = fs[0x140:0x148][::-1]
-            with tempfile.TemporaryDirectory(dir=HERE / 'Odyssey_build') as temp:
+            with tempfile.TemporaryDirectory(dir=out.parent) as temp:
                 image = Path(temp) / 'control-romfs.bin'
                 verify_ivfc(fs, end - start,
                             lambda offset, length: ctr.read(start + offset, length, upper), image)

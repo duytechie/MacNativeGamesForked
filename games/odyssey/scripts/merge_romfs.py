@@ -4,6 +4,7 @@
 Game data and keys remain local. The update IVFC authenticates every output block.
 """
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import json
 import sys
@@ -36,26 +37,38 @@ class DirectBase:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('game', type=Path, help='Local combined Odyssey XCI or NSP')
+    parser.add_argument('game', type=Path, help='Local Odyssey base XCI/NSP, or combined base + update package')
+    parser.add_argument('--update', type=Path, help='Separate Odyssey update 1.3.0 NSP')
     parser.add_argument('--keys', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
     require(not args.output.exists(), 'Output already exists')
     keys = load_keys(args.keys)
-    with args.game.open('rb') as f:
-        _, entries = container_entries(f, args.game.stat().st_size)
-        records = nca_inventory(f, entries, keys)
-        programs = [(r, h) for r, h in records if r['content_type'] == 0 and r['title_id'] == '0100000000010000']
-        require(len(programs) == 2, 'Expected exactly one base and one update Program NCA')
-        sections = [(r, h, romfs_section(h)) for r, h in programs]
-        base_items = [(r, h, s) for r, h, s in sections if s[2][4] == 3]
-        update_items = [(r, h, s) for r, h, s in sections if s[2][4] == 4]
+    with ExitStack() as stack:
+        def inventory(path):
+            source = stack.enter_context(path.open('rb'))
+            _, entries = container_entries(source, path.stat().st_size)
+            records = nca_inventory(source, entries, keys)
+            programs = [(r, h, romfs_section(h)) for r, h in records
+                        if r['content_type'] == 0 and r['title_id'] == '0100000000010000']
+            return source, programs, common_tickets(source, entries)
+
+        base_source, base_sections, base_tickets = inventory(args.game)
+        if args.update:
+            update_source, update_sections, update_tickets = inventory(args.update)
+            require(len(base_sections) == len(update_sections) == 1,
+                    'Expected one Odyssey Program NCA in each separate base and update package')
+        else:
+            require(len(base_sections) == 2, 'Expected exactly one base and one update Program NCA; '
+                    'for separate packages pass --update UPDATE.nsp')
+            update_source, update_sections, update_tickets = base_source, base_sections, base_tickets
+        base_items = [(r, h, s) for r, h, s in base_sections if s[2][4] == 3]
+        update_items = [(r, h, s) for r, h, s in update_sections if s[2][4] == 4]
         require(len(base_items) == len(update_items) == 1, 'Expected direct base and BKTR update RomFS')
         brec, bhdr, (bstart, bend, bfs) = base_items[0]
         urec, uhdr, (ustart, uend, ufs) = update_items[0]
-        tickets = common_tickets(f, entries)
-        base_ctr = Ctr(f, brec['nca_offset'], brec['size'], nca_ctr_key(bhdr, keys, tickets))
-        update_ctr = Ctr(f, urec['nca_offset'], urec['size'], nca_ctr_key(uhdr, keys, tickets))
+        base_ctr = Ctr(base_source, brec['nca_offset'], brec['size'], nca_ctr_key(bhdr, keys, base_tickets))
+        update_ctr = Ctr(update_source, urec['nca_offset'], urec['size'], nca_ctr_key(uhdr, keys, update_tickets))
         base = DirectBase(base_ctr, bstart, bend, bfs)
         patched = Patched(update_ctr, ustart, uend, ufs, base)
         args.output.mkdir(parents=True)
@@ -63,7 +76,8 @@ def main():
         counts, size, digest = verify_ivfc(ufs, patched.total, patched.read, image)
         files = index_romfs(image)
         report = dict(status='pass', base_program=brec, update_program=urec,
-                      source_size=args.game.stat().st_size, ivfc_blocks=counts,
+                      source_size=args.game.stat().st_size + (args.update.stat().st_size if args.update else 0),
+                      ivfc_blocks=counts,
                       romfs_size=size, romfs_sha256=digest,
                       bytes_from_base=patched.from_base, bytes_from_update=patched.from_update,
                       files=files,

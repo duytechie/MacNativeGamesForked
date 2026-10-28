@@ -34,7 +34,7 @@ Exact measurements and logs are in the development log below and in the project'
 ## What you need
 
 - An Apple silicon Mac with macOS 26 or newer, and Xcode with the Metal 4 SDK (tested with Xcode 27.1).
-- Super Mario Odyssey with the **1.3.0** update, as a combined XCI or NSP that you dumped yourself. Other versions are
+- Super Mario Odyssey with the **1.3.0** update, as a combined XCI/NSP or separate base and update NSPs that you dumped yourself. Other versions are
   rejected by hash, including **1.4.1**: it has the same executables but slightly different data, and is not
   supported yet (see "Version naming" below).
 - `prod.keys` dumped from your own Switch.
@@ -55,6 +55,19 @@ python3 -m venv .venv && .venv/bin/pip install capstone cryptography lz4
 .venv/bin/python scripts/build_odyssey.py --game YOUR_GAME.xci --keys prod.keys --firmware YOUR_FIRMWARE_FOLDER
 open Odyssey_build/Odyssey.app
 ```
+
+For separate base and update NSPs, use `--game` for the base and `--update` for the update:
+
+```bash
+.venv/bin/python scripts/build_odyssey.py \
+  --game "/path/to/odyssey.nsp" \
+  --update "/path/to/update.1.3.0.nsp" \
+  --keys "/path/to/prod.keys" \
+  --firmware "/path/to/unpacked/firmware-ncas"
+```
+
+The two packages are read directly; no combined NSP is created. The update supplies the executable modules and
+1.3.0 icon, and its RomFS patch is applied to the base game's data. The same pinned 1.3.0 hashes are checked.
 
 The script runs eight steps and stops with a clear message if something is missing:
 
