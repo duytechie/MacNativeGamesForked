@@ -157,17 +157,20 @@ class NspInputs(unittest.TestCase):
                 self.fail('invalid input accepted')
 
     def test_update_only_icon_and_custom_work_folder(self):
-        nacp = bytearray(0x3070)
-        nacp[0x3060:0x3065] = b'1.3.0'
         jpeg = b'\xff\xd8\xffsynthetic icon\xff\xd9'
-        fs, section = ivfc(romfs({'control.nacp': nacp, 'icon_AmericanEnglish.dat': jpeg}))
-        update = self.nsp('control.nsp', self.nca(fs, section, 3, content_type=2))
-        output = self.root / 'custom_build/app-assets/icon.jpg'
-        with patch.object(extract_app_icon, 'HERE', self.root), patch.object(sys, 'argv',
-                ['extract_app_icon.py', str(update), '--keys', str(self.keys), '--output', str(output)]), \
-                redirect_stdout(io.StringIO()):
-            extract_app_icon.main()
-        self.assertEqual(output.read_bytes(), jpeg)
+        for version in ('1.3.0', '1.4.1'):
+            with self.subTest(version=version):
+                nacp = bytearray(0x3070)
+                nacp[0x3060:0x3065] = version.encode()
+                fs, section = ivfc(romfs({'control.nacp': nacp, 'icon_AmericanEnglish.dat': jpeg}))
+                update = self.nsp('control.nsp', self.nca(fs, section, 3, content_type=2))
+                output = self.root / 'custom_build/app-assets/icon.jpg'
+                with patch.object(extract_app_icon, 'HERE', self.root), patch.object(sys, 'argv',
+                        ['extract_app_icon.py', str(update), '--keys', str(self.keys), '--output', str(output)]), \
+                        redirect_stdout(io.StringIO()):
+                    extract_app_icon.main()
+                self.assertEqual(output.read_bytes(), jpeg)
+                self.assertEqual(output.with_name('game-version.txt').read_text(), version + '\n')
 
     def test_builder_routes_both_input_modes(self):
         for separate in (False, True):

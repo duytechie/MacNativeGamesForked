@@ -117,13 +117,30 @@ class ModManifest(unittest.TestCase):
         self.assertIn('1 files', result.stdout)
 
     def test_botw_app_path_takes_the_version_from_the_folder(self):
+        for version in ('botw160', 'botw190'):
+            with self.subTest(version):
+                app = self.root/version/'Breath of the Wild.app'
+                fake_romfs(app/'Contents/Resources/totk/extracted'/version/'romfs')
+                self.mod = self.root/version/'mods'/version
+                self.put('Pack/A.pack.zs', b'modded a')
+                result = run(self.mod, '--app', app)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('1 files', result.stdout)
+
+    def test_botw190_app_with_a_named_version(self):   # a mod folder under any name, with the version passed
         app = self.root/'Breath of the Wild.app'
-        fake_romfs(app/'Contents/Resources/totk/extracted/botw160/romfs')
-        self.mod = self.root/'mods/botw160'
-        self.put('Pack/A.pack.zs', b'modded a')
-        result = run(self.mod, '--app', app)
+        romfs = app/'Contents/Resources/totk/extracted/botw190/romfs'
+        fake_romfs(self.root/'data')                       # the app holds a link to romfs.bin (build_app.py place_data_bundle)
+        romfs.mkdir(parents=True)
+        (romfs/'romfs.bin').symlink_to(self.root/'data/romfs.bin')
+        (romfs/'runtime-index.bin').write_bytes((self.root/'data/runtime-index.bin').read_bytes())
+        self.mod = self.root/'library'
+        self.put('Sound/B.bwav', b'dubbed')
+        result = run(self.mod, '--app', app, '--version', 'botw190')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('1 files', result.stdout)
+        lines = [l for l in (self.mod/'manifest.tsv').read_text().splitlines() if not l.startswith('#')]
+        self.assertEqual(lines, ['\t'.join(['Sound/B.bwav', '6', hashlib.sha256(b'dubbed').hexdigest(),
+                                            hashlib.sha256(FILES['Sound/B.bwav']).hexdigest()])])
 
 
 
@@ -190,6 +207,22 @@ class MergeWithBuildPatch(unittest.TestCase):
         again = run(self.mod, '--romfs', self.romfs)   # a second run merges the kept copy again, the same way
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual((self.mod/COMMON).read_bytes(), merged)
+
+    @unittest.skipUnless(importlib.util.find_spec('fontTools'), 'needs fontTools')
+    def test_button_icons_merge_the_common_archive_too(self):
+        # make_button_icons.py redraws the button guide in this archive; its manifest used to name the RomFS original,
+        # and the game stopped at start: two overlays replaced the same file
+        import make_button_icons
+        self.put_mod({**self.members, 'timg/__Combined.bntx': b'keyboard textures' * 40})
+        index = make_mod_manifest.read_index(self.romfs/'runtime-index.bin')
+        merged, found = make_button_icons.write_mod_manifest(self.mod, self.romfs, index)
+        self.assertEqual(list(merged), [COMMON])
+        data = (self.mod/COMMON).read_bytes()
+        self.assertEqual(self.member(data, 'timg/__Combined.bntx'), b'keyboard textures' * 40)
+        for name in CAPTURE:
+            self.assertEqual(self.member(data, name), self.member(self.build, name))
+        self.assertEqual(found.lines, ['\t'.join([COMMON, str(len(data)), hashlib.sha256(data).hexdigest(),
+                                                  hashlib.sha256(self.build).hexdigest()])])
 
     def test_mod_that_changes_a_patched_member_is_refused(self):
         changed = bflan(CAPTURE['anim/AutoBuilder_00_In.bflan'], frame=0.5)

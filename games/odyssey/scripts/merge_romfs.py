@@ -38,7 +38,7 @@ class DirectBase:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('game', type=Path, help='Local Odyssey base XCI/NSP, or combined base + update package')
-    parser.add_argument('--update', type=Path, help='Separate Odyssey update 1.3.0 NSP')
+    parser.add_argument('--update', type=Path, help='Separate Odyssey update 1.3.0 or 1.4.1 NSP')
     parser.add_argument('--keys', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
