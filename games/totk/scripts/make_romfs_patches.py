@@ -114,7 +114,7 @@ def main():
     if args.output_dir == root / 'extracted/v0/romfs-patches': args.output_dir = root / (f'extracted/{version}/romfs-patches' + (f'-{args.aspect}' + ('-center' if args.hud == 'center' else '') if args.aspect else ''))
     assert 0 <= args.capture_frame <= 0.5
     manifest = json.loads((root / f'extracted/{version}/romfs/index.json').read_text())
-    assert manifest['status'] == 'pass'
+    assert manifest['status'] in ('pass', 'unverified')
     files = {f['path']: f for f in manifest['files']}
     out_dir = args.output_dir
     ARCHIVE = common_archive(version)

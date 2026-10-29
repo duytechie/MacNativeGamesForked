@@ -515,11 +515,26 @@ def decoder(romfs, read, game='totk'):
     return decode
 
 
+def decode_candidate(decode, raw, name, *, unverified=False, game='totk'):
+    """An unverified build may omit unreadable optional archives from its shader scan."""
+    try:
+        return decode(raw)
+    except Exception as error:
+        error.add_note(f'Cannot decode RomFS shader candidate: {name}')
+        if unverified and game == 'totk' and not startup_package(name, game):
+            from compression.zstd import ZstdError
+            if isinstance(error, ZstdError):
+                print(f'WARNING: unverified update: skipping unreadable optional shader candidate {name}: {error}',
+                      flush=True)
+                return None
+        raise
+
+
 def inventory(romfs, modules=None, game='totk'):
     """Every shader in the RomFS and the game modules -> (stage, control, code, source path), the keys translated for
     the default bind state (startup packages, agl packages, the modules), the archives. modules: rewritten/<version>."""
     index = json.loads((romfs/'index.json').read_text())
-    if index.get('status') != 'pass':
+    if index.get('status') not in ('pass', 'unverified'):
         raise ValueError('RomFS has not passed integrity verification')
     entries = {r['path']: r for r in index['files']}
     folders = GAMES[game]['folders']
@@ -563,7 +578,10 @@ def inventory(romfs, modules=None, game='totk'):
             # Only containers can hold shaders: compressed files, packages and shader archives.
             if raw[:4] not in (ZSTD, YAZ0, b'SARC', b'FSHA', b'BNSH', b'BAHS') and b'BNSH\0\0\0\0' not in raw:
                 continue
-            data = decode(raw)
+            data = decode_candidate(decode, raw, name, unverified=index.get('status') == 'unverified', game=game)
+            if data is None:
+                archives.append(dict(path=name, sha256=digest(raw), skipped='unreadable optional archive'))
+                continue
             keys = set()
             visit(name, data, keys)
             if startup_package(name, game):
@@ -624,7 +642,11 @@ def source_reader(romfs, modules, game='totk'):
             parts = source.split('/')
             for cut in range(len(parts), 0, -1):
                 if '/'.join(parts[:cut]) in entries:
-                    data = decode(raw('/'.join(parts[:cut])))
+                    package = '/'.join(parts[:cut])
+                    data = decode_candidate(decode, raw(package), package,
+                                            unverified=index.get('status') == 'unverified', game=game)
+                    if data is None:
+                        break
                     for member in parts[cut:]:
                         members = sarc(data) if data[:4] == b'SARC' else {}
                         if member not in members:

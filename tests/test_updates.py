@@ -244,6 +244,8 @@ class Updates(unittest.TestCase):
     def test_merge_accepts_hactool_signature_checks_it_cannot_perform(self):
         # Real hactool prints the NCA fixed-key and NPDM signature checks as (FAIL) on a successful merge:
         # it has no Nintendo public key. The merge must judge the data, not those lines.
+        # A repacked NCA's old content-ID filename is also not a new reason to reject verified data.
+        self.update.write_bytes(partition([('a' * 32 + '.nca', update_nca()), ('common.tik', ticket())]))
         space = patch('extract_update_romfs.shutil.disk_usage')
         space.start().return_value.free = 100 * 2**30
         self.addCleanup(space.stop)
@@ -261,6 +263,99 @@ class Updates(unittest.TestCase):
         merge(base, self.update, self.keys, helper, out)
         self.assertEqual((out/'romfs.bin').read_bytes(), romfs())
 
+    def test_merge_reports_failed_ivfc_level_and_update_content_id_mismatch(self):
+        # The code modules can be intact while the update's RomFS data is damaged.
+        self.update.write_bytes(partition([('a' * 32 + '.nca', update_nca()), ('common.tik', ticket())]))
+        base = self.root/'base.nsp'; base.write_bytes(game_image('nsp', managed=True))
+        out = self.root/'merged'
+
+        def failed_merge(command, **kwargs):
+            kwargs['stdout'].write('\n'.join(f'Level {i} (GOOD)' for i in range(5)) + '\nLevel 5 (FAIL):\n')
+            return subprocess.CompletedProcess(command, 0)  # hactool does not set an error exit status here
+
+        with patch('extract_update_romfs.shutil.disk_usage') as space, \
+             patch('extract_update_romfs.subprocess.run', side_effect=failed_merge):
+            space.return_value.free = 100 * 2**30
+            with self.assertRaisesRegex(ValueError, r'BKTR verification failed: Level 5 \(FAIL\)') as caught:
+                merge(base, self.update, self.keys, self.root/'hactool', out)
+        self.assertIn('Update Program NCA SHA-256 does not match its content ID', str(caught.exception))
+        self.assertIn(str(self.root/'merged-failure.log'), str(caught.exception))
+        self.assertIn('Level 5 (FAIL)', (self.root/'merged-failure.log').read_text())
+        self.assertFalse(out.exists())
+        self.assertFalse(list(self.root.glob('update-merge-*')))
+
+    def test_merge_retains_redacted_diagnostics_for_exit_and_incomplete_verification(self):
+        base = self.root/'base.nsp'; base.write_bytes(game_image('nsp', managed=True))
+        secret = 'ab' * 17
+        scenarios = [(1, f'Key ({secret}) must be 32 hex digits!\n', 'hactool exit 1'),
+                     (0, 'Level 0 (GOOD)\n', 'Missing verified IVFC levels: 1, 2, 3, 4, 5')]
+        for i, (code, log, message) in enumerate(scenarios):
+            with self.subTest(code=code):
+                out = self.root/f'failed-{i}'
+
+                def failed_merge(command, **kwargs):
+                    kwargs['stdout'].write(log)
+                    return subprocess.CompletedProcess(command, code)
+
+                with patch('extract_update_romfs.shutil.disk_usage') as space, \
+                     patch('extract_update_romfs.subprocess.run', side_effect=failed_merge):
+                    space.return_value.free = 100 * 2**30
+                    with self.assertRaises(ValueError) as caught:
+                        merge(base, self.update, self.keys, self.root/'hactool', out)
+                self.assertIn(message, str(caught.exception))
+                failure = out.with_name(out.name+'-failure.log')
+                self.assertIn(str(failure), str(caught.exception))
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(secret, failure.read_text())
+                self.assertFalse(out.exists())
+                self.assertFalse(list(self.root.glob('update-merge-*')))
+
+    def test_explicit_override_retains_failed_data_but_rejects_tool_and_structural_errors(self):
+        base = self.root/'base.nsp'; base.write_bytes(game_image('nsp', managed=True))
+        levels = '\n'.join(f'Level {i} (GOOD)' for i in range(5)) + '\nLevel 5 (FAIL):\n'
+        for i, (code, log, accepted) in enumerate([(0, levels, True), (1, levels, False),
+                                                  (0, levels + 'Error: section is corrupted!\n', False),
+                                                  (0, 'Level 5 (FAIL):\n', False)]):
+            with self.subTest(code=code, log=log):
+                out = self.root/f'override-{i}'
+
+                def extraction(command, **kwargs):
+                    image = Path(next(s.split('=', 1)[1] for s in command if s.startswith('--section')))
+                    image.write_bytes(romfs())
+                    kwargs['stdout'].write(log)
+                    return subprocess.CompletedProcess(command, code)
+
+                with patch('extract_update_romfs.shutil.disk_usage') as space, \
+                     patch('extract_update_romfs.subprocess.run', side_effect=extraction):
+                    space.return_value.free = 100 * 2**30
+                    if accepted:
+                        merge(base, self.update, self.keys, self.root/'hactool', out, allow_unverified=True)
+                        report = json.loads((out/'index.json').read_text())
+                        self.assertEqual(report['status'], 'unverified')
+                        self.assertEqual(report['verification_failures'], ['Level 5 (FAIL):'])
+                        self.assertEqual((out/'romfs.bin').read_bytes(), romfs())
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'BKTR verification failed'):
+                            merge(base, self.update, self.keys, self.root/'hactool', out, allow_unverified=True)
+                        self.assertFalse(out.exists())
+                self.assertFalse(list(self.root.glob('update-merge-*')))
+
+    def test_unverified_cache_requires_explicit_override_on_every_build(self):
+        folder = self.root/'tree/extracted/v121/romfs'; folder.mkdir(parents=True)
+        (folder/'romfs.bin').write_bytes(romfs())
+        import hashlib
+        digest = hashlib.sha256(romfs()).hexdigest()
+        (folder/'index.json').write_text(json.dumps(dict(status='unverified', romfs_size=len(romfs()), romfs_sha256=digest)))
+        pins = dict(build_app.VERSIONS['v121'], romfs=dict(size=len(romfs()), sha256=digest))
+        with patch.dict(build_app.VERSIONS, v121=pins), patch.object(build_app, 'run') as run, \
+             patch.object(build_app, 'build_hactool', side_effect=build_app.BuildError('strict rebuild')) as tool:
+            build_app.step_update_data(self.root/'tree', Path('base'), self.update, self.keys, self.root/'logs',
+                                       version='v121', allow_unverified=True)
+            tool.assert_not_called()
+            self.assertTrue(run.called)
+            with self.assertRaisesRegex(build_app.BuildError, 'strict rebuild'):
+                build_app.step_update_data(self.root/'tree', Path('base'), self.update, self.keys, self.root/'logs', version='v121')
+
     def test_bundle_contains_only_selected_game_version(self):
         for version, display in (('v112', '1.1.2'), ('v121', '1.2.1'), ('v143', '1.4.3')):
             with self.subTest(version=version):
@@ -273,6 +368,8 @@ class Updates(unittest.TestCase):
                 files+=[f'build/game-data/{version}/{n}' for n in build_app.GAME_DATA]
                 for rel in files:
                     p=tree/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(b'test')
+                if version == 'v121':
+                    (tree/f'extracted/{version}/romfs/index.json').write_text(json.dumps(dict(status='unverified')))
                 import hashlib
                 (tree/f'build/shader-seed/{version}/seed-manifest.json').write_text(json.dumps(dict(
                     version=version, chain='totk-native-v8-unverified', shaders=8000,
@@ -284,6 +381,7 @@ class Updates(unittest.TestCase):
                 signing.assert_called_once_with(out.with_name(out.name+'.partial'),self.root/'logs')
                 info=plistlib.loads((out/'Contents/Info.plist').read_bytes())
                 self.assertEqual(info['CFBundleShortVersionString'],display)
+                self.assertEqual(info.get('MNGUpdateDataIntegrity'), 'unverified' if version == 'v121' else None)
                 if version == 'v112': self.assertEqual(info['MNGSourceRevision'], 'a'*40)
                 else: self.assertNotIn('MNGSourceRevision', info)
                 self.assertIn('zh-Hans',info['CFBundleLocalizations']);self.assertIn('zh-Hant',info['CFBundleLocalizations'])

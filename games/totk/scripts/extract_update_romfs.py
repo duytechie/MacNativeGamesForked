@@ -57,7 +57,7 @@ def hactool_prod_keys(source, target):
         f.write('\n'.join(lines) + ('\n' if lines else ''))
 
 
-def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
+def merge(base, update, keys_path, hactool, output, *, base_romfs=None, allow_unverified=False):
     require(not output.exists(), 'Output exists')
     keys = load_keys(keys_path)
     inputs = []
@@ -113,20 +113,51 @@ def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
         # levels and the image SHA-256 recorded below decide whether the merge worked.
         unsigned = re.compile(r'\s*(?:Fixed-Key Signature|NPDM Signature) \(FAIL\)')
         checked = '\n'.join(line for line in log.splitlines() if not unsigned.match(line))
-        if code or re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', checked):
-            # hactool repeats a key it cannot parse ("Key (<value>) must be 32 hex digits!"): keep no long hex in the log
-            (output.parent/(output.name+'-failure.log')).write_text(re.sub(r'[0-9A-Fa-f]{32,}', '<hex removed>', log))
-        require(code == 0 and not re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', checked), 'BKTR verification failed')
-        require(all(re.search(rf'Level {i} \(GOOD\)', log) for i in range(6)), 'Missing verified IVFC levels')
+        failures = [line.strip() for line in checked.splitlines()
+                    if re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', line)]
+        missing = [i for i in range(6) if not re.search(rf'Level {i} \(GOOD\)', log)]
+        overridden = False
+        if code or failures or missing:
+            # hactool repeats a key it cannot parse ("Key (<value>) must be 32 hex digits!"):
+            # redact both the retained log and the error shown by build_app.py.
+            def redact(text):
+                return re.sub(r'[0-9A-Fa-f]{32,}', '<hex removed>', text)
+
+            failure_log = output.parent/(output.name+'-failure.log')
+            failure_log.write_text(redact(log))
+            details = [f'hactool exit {code}'] if code else []
+            details.extend(redact(line)[:240] for line in failures[:3])
+            if missing and not failures:
+                details.append('Missing verified IVFC levels: ' + ', '.join(map(str, missing)))
+            # A content-ID mismatch alone can also mean a repacked NCA. Use it as a
+            # diagnostic only after verification fails, never as a new import restriction.
+            if re.fullmatch(r'[0-9a-fA-F]{32}\.nca', record['name']):
+                with (tmp/'update.nca').open('rb') as f:
+                    digest = hashlib.file_digest(f, 'sha256').hexdigest()
+                if digest[:32] != record['name'][:32].lower():
+                    details.append('Update Program NCA SHA-256 does not match its content ID; '
+                                   'the update may be modified or damaged. Re-dump the update from your console')
+            message = 'BKTR verification failed: ' + '; '.join(details) + f'; full details: {failure_log}'
+            # The explicit override covers data checks only. Tool errors, incomplete
+            # verification and unreadable/invalid structures must still stop extraction.
+            overridden = (allow_unverified and code == 0 and bool(failures)
+                          and all(re.fullmatch(r'Level [0-5] \(FAIL\):?', line) for line in failures)
+                          and all(re.search(rf'Level {i} \((?:GOOD|FAIL)\)', log) for i in range(6)))
+            require(overridden, message)
+            print('WARNING: continuing with unverified update data: ' + message, flush=True)
         image = result/'romfs.bin'
         with image.open('rb') as f:
             digest = hashlib.file_digest(f, 'sha256').hexdigest()
         files = index_romfs(image)
-        report = dict(status='pass', romfs_size=image.stat().st_size, romfs_sha256=digest,
-                      files=files, integrity='BKTR merge; all six IVFC levels verified')
+        report = dict(status='unverified' if overridden else 'pass', romfs_size=image.stat().st_size,
+                      romfs_sha256=digest, files=files,
+                      integrity='UNVERIFIED: update data checks explicitly overridden' if overridden else
+                                'BKTR merge; all six IVFC levels verified')
+        if overridden:
+            report['verification_failures'] = failures
         (result/'index.json').write_text(json.dumps(report, indent=2)+'\n')
         result.rename(output)
-    print(json.dumps(dict(status='pass', files=len(files), sha256=digest)))
+    print(json.dumps(dict(status=report['status'], files=len(files), sha256=digest)))
 
 
 if __name__ == '__main__':
@@ -137,5 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('--hactool', required=True, type=Path)
     parser.add_argument('--base-romfs', type=Path, help='full decrypted base IVFC section, including hash levels (not a raw RomFS image)')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--allow-unverified-update', action='store_true', help='continue after failed IVFC data checks and mark the output unverified')
     args = parser.parse_args()
-    merge(args.base, args.update, args.keys, args.hactool, args.output, base_romfs=args.base_romfs)
+    merge(args.base, args.update, args.keys, args.hactool, args.output, base_romfs=args.base_romfs,
+          allow_unverified=args.allow_unverified_update)

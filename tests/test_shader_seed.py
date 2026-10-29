@@ -47,6 +47,41 @@ def bnsh_botw():
 
 
 class ShaderInventory(unittest.TestCase):
+    def test_only_unverified_optional_archives_can_skip_decompression_failures(self):
+        from compression.zstd import ZstdError
+        error = ZstdError('Data corruption detected')
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            bad, good = seed.ZSTD+b'bad', seed.ZSTD+b'good'
+            (folder/'romfs.bin').write_bytes(bad+good)
+            entries = [dict(path='Pack/Actor/bad.pack.zs', offset=0, size=len(bad)),
+                       dict(path='Shader/good.zs', offset=len(bad), size=len(good))]
+
+            def decode(raw):
+                if raw == bad:
+                    raise error
+                return bnsh()
+
+            with mock.patch.object(seed, 'decoder', return_value=decode):
+                for status in ('pass', 'unverified'):
+                    (folder/'index.json').write_text(json.dumps(dict(status=status, files=entries)))
+                    if status == 'pass':
+                        with self.assertRaises(ZstdError) as caught:
+                            seed.inventory(folder)
+                        self.assertIn('Pack/Actor/bad.pack.zs', str(caught.exception.__notes__))
+                    else:
+                        _, shaders, startup, archives = seed.inventory(folder)
+                        self.assertEqual(len(shaders), 3)
+                        self.assertEqual(len(startup), 3)
+                        self.assertEqual(archives[0]['skipped'], 'unreadable optional archive')
+                        self.assertIsNone(seed.source_reader(folder, None)('Pack/Actor/bad.pack.zs'))
+            for name in ('Shader/bad.zs', 'Pack/Bootup.Nin_NX_NVN.pack.zs'):
+                with self.assertRaises(ZstdError):
+                    seed.decode_candidate(decode, bad, name, unverified=True)
+            with self.assertRaisesRegex(ValueError, 'unbounded'):
+                seed.decode_candidate(mock.Mock(side_effect=ValueError('unbounded shader package')), bad,
+                                      'Pack/Actor/bad.pack.zs', unverified=True)
+
     def test_the_key_hashes_the_control_sections_own_size_as_the_runtime_does(self):
         self.assertEqual(seed.control_key_len(bytes(0x880)), 0x880)              # no size word: the NVN 55 section
         self.assertEqual(seed.control_key_len(bytes(0x20)+struct.pack('<I', 0x88c)+bytes(0x860)), 0x880)   # 0x88c: hashed as 0x880

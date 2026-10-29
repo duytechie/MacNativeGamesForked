@@ -894,7 +894,7 @@ static FILE *mng_open_base(const char *path) {
     return source/'hactool'
 
 
-def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None):
+def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None, allow_unverified=False):
     expected = VERSIONS[version]
     folder = tree/f'extracted/{version}/romfs'
     index = folder/'index.json'
@@ -902,7 +902,8 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None
     if index.is_file() and (folder/'romfs.bin').is_file():
         try:
             report = json.loads(index.read_text())
-            valid = (report.get('status') == 'pass' and report['romfs_sha256'] == expected['romfs']['sha256']
+            valid = ((report.get('status') == 'pass' and report['romfs_sha256'] == expected['romfs']['sha256']
+                      or allow_unverified and report.get('status') in ('pass', 'unverified'))
                      and (folder/'romfs.bin').stat().st_size == expected['romfs']['size'])
         except (ValueError, KeyError):
             pass
@@ -912,10 +913,16 @@ def step_update_data(tree, game, update, keys, logs, *, version='v112', mod=None
             shutil.rmtree(folder)
         say(f'2/4 update: merging base + {expected["display_version"]} and verifying all IVFC levels')
         run([tree/'.venv/bin/python', 'scripts/extract_update_romfs.py', game, update,
-             '--keys', keys, '--hactool', hactool, '--output', folder], logs/'update-romfs.log', cwd=tree)
+             '--keys', keys, '--hactool', hactool, '--output', folder,
+             *(['--allow-unverified-update'] if allow_unverified else [])], logs/'update-romfs.log', cwd=tree)
         report = json.loads(index.read_text())
-        check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
+        if not allow_unverified:
+            check(f'{expected["display_version"]} RomFS', report['romfs_sha256'], expected['romfs']['sha256'])
         check(f'{expected["display_version"]} RomFS size', report['romfs_size'], expected['romfs']['size'])
+    if allow_unverified and (report.get('status') == 'unverified' or report['romfs_sha256'] != expected['romfs']['sha256']):
+        report.update(status='unverified', integrity='UNVERIFIED: update data checks explicitly overridden')
+        index.write_text(json.dumps(report, indent=2)+'\n')
+        say(f'2/4 update: using unverified {expected["display_version"]} data (--allow-unverified-update)')
     heapdef = mod_heapdef(mod)
     if heapdef:
         say(f'2/4 update: the overlays are built on the mod\'s heap sizes ({heapdef})')
@@ -1475,6 +1482,11 @@ def step_app(tree, out, logs, *, version="v0", game='totk'):
         clone(icon, tmp / 'Contents/Resources/AppIcon.icns')
         info['CFBundleIconFile'] = 'AppIcon'
     info['MNGContributionFolder'] = str(contrib_folder())   # app/launcher.m contrib_file: where players find it
+    try:
+        if json.loads((tree / f'extracted/{version}/romfs/index.json').read_text()).get('status') == 'unverified':
+            info['MNGUpdateDataIntegrity'] = 'unverified'
+    except (OSError, ValueError):
+        pass
     commit = source_commit()
     if commit:
         info['MNGSourceCommit'] = commit   # app/launcher.m -> TOTK_SOURCE_COMMIT: the HUD box shows which commit the app is
@@ -1869,6 +1881,7 @@ def parse_args(argv):
                                  epilog='example: python3 build_app.py ~/Games/totk.xci -k ~/keys/prod.keys')
     ap.add_argument('game', type=Path, help='the game file (.xci or .nsp), base game 1.0.0 (Breath of the Wild: the 1.6.0 card image, or the base NSP with --update)')
     ap.add_argument('--update', type=Path, help='separate supported cumulative update NSP/NSZ; outputs the same single app (Breath of the Wild: the 1.9.0 update NSP, not for a card image)')
+    ap.add_argument('--allow-unverified-update', action='store_true', help='TOTK: ignore update RomFS checksum failures for this build; game data may be damaged')
     ap.add_argument('--dlc', type=Path, action='append', metavar='DLC.nsp', help='Breath of the Wild with a separate 1.6.0 or 1.9.0 --update: an add-on content (DLC) NSP; repeat for the second pack (01007EF00011F001, 01007EF00011F002); each is optional, and a pack left out is not in the app; such a build takes its packs from --dlc only, also when the game file is a card image')
     ap.add_argument('--platform', choices=('macos','ios','visionos'), default='macos', help='build a macOS app (default), unsigned iPhone/iPad IPA, or native Vision Pro IPA')
     ap.add_argument('--ios-game-data', choices=('app', 'documents'), default='app',
@@ -1912,6 +1925,8 @@ def main(argv):
     update = args.update.expanduser().resolve() if args.update else None
     if update and (not update.is_file() or input_kind(update) not in ('nsp', 'nsz')):
         raise BuildError('--update must be a separate cumulative NSP or NSZ')
+    if args.allow_unverified_update and not update:
+        raise BuildError('--allow-unverified-update requires --update')
     mod = args.mod.expanduser().resolve() if args.mod else None
     if mod and not ((mod / 'exefs').is_dir() or (mod / 'romfs').is_dir()):
         raise BuildError(f'--mod expects a mod folder prepared before the build (its files under exefs/ and/or romfs/): '
@@ -1954,6 +1969,8 @@ def main(argv):
     # The game decides the platforms, the work folder and the disk space needed, so it is identified before those checks.
     tree = prepare_work(work, py, logs)
     which = identify_game(tree, game, keys, logs)
+    if args.allow_unverified_update and which != 'totk':
+        raise BuildError('--allow-unverified-update is supported only for Tears of the Kingdom')
     if kind == 'nsp' and which != 'botw' and not fonts_given:   # only Breath of the Wild's fonts passed the check above
         raise no_fonts
     if dlcs and which != 'botw':
@@ -2057,7 +2074,8 @@ def main(argv):
                   mod=code_mod)   # a mod is for the updated main, not for 1.0.0
     step_data(tree, game, keys, logs, firmware=firmware, shared_fonts=shared_fonts, mod=None if update else mod)
     if update:
-        step_update_data(tree, game, update, keys, logs, version=version, mod=mod)
+        step_update_data(tree, game, update, keys, logs, version=version, mod=mod,
+                         allow_unverified=args.allow_unverified_update)
     if mod:
         check_mod_overlays(tree, mod, version)
     step_shaders(tree, logs, version=version)

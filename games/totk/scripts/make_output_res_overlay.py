@@ -65,7 +65,7 @@ assert 640 <= w <= 7680 and 360 <= h <= 4320, 'size out of range'
 assert not args.scene or version == 'v143', '--scene: only 1.4.3 renders its scene at TOTK_RENDER_RES'
 assert not args.scene or (64 <= sw <= 4096 and 64 <= sh <= 4096), 'scene size out of range (TOTK_RENDER_RES: 64..4096)'
 manifest = json.loads((root / f'extracted/{version}/romfs/index.json').read_text())
-assert manifest['status'] == 'pass'
+assert manifest['status'] in ('pass', 'unverified')
 files = {f['path']: f for f in manifest['files']}
 
 def sarc_members(data):

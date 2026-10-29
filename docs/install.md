@@ -6,7 +6,7 @@ This page only covers turning **your own** game files into an app on your Mac, i
 
 Contents: [What you need](#what-you-need) · [Build the app](#build-the-app) · [Breath of the Wild](#breath-of-the-wild) · [iPhone and iPad](#iphone-and-ipad) · [Apple Vision Pro](#apple-vision-pro) · [Update the app](#update-the-app) · [When the build stops](#when-the-build-stops) · [Where things are](#where-things-are) · [Known issues](#known-issues)
 
-Ground rules: use only files from your own Switch and your own game. Nothing is downloaded for you, and nothing from the game is in this repository. Never edit `games/totk/assets/expected-*.json` or the scripts to get past a check: the error message says what is wrong. The app you build contains the game: it is for you only.
+Ground rules: use only files from your own Switch and your own game. Nothing is downloaded for you, and nothing from the game is in this repository. Never edit `games/totk/assets/expected-*.json` or the scripts to get past a check: the error message says what is wrong. For a diagnostic TOTK build, `--allow-unverified-update` explicitly overrides update RomFS checksum failures and marks the extracted data and app as unverified; damaged data may cause game errors. Its shader scan records and skips optional archives that cannot decompress. Required startup shaders, code, layout and image-size checks remain enabled. The app you build contains the game: it is for you only.
 
 ## What you need
 
@@ -176,7 +176,7 @@ Read the `ERROR:` line and the log file it names (`<work folder>/logs/…`), fix
 | `… add-on content (DLC), not the game`, `pass it as …`, `use the files of one game` | A file is on the wrong option; the message names the right one. |
 | `the game file holds [...]: expected Tears of the Kingdom … or Breath of the Wild` | Another game: build it with its own `games/<name>/README.md`. |
 | `needs about N GB free` | Free space, or `--work` and `-o` on an APFS volume with room. |
-| `BKTR verification failed`, an error merging the update | `git pull` first. If it stays, your keys may be older than the update: dump `prod.keys` again on current firmware. |
+| `BKTR verification failed`, an error merging the update | Read the `full details` log named in the error. `Level … (FAIL)` means the merged data failed its integrity check. If the update Program NCA also fails its content-ID hash, re-dump the update; intact code modules do not prove the update's game data is intact. For missing-key errors, dump `prod.keys` again on current firmware. Keep the work folder and rerun the same command after replacing the bad input. |
 | `make failed`, `xcrun failed` | Read the named log; usually incomplete developer tools or Homebrew outside `/opt/homebrew`. |
 | iOS signing or install errors | Apple ID in Xcode › Settings › Accounts, device unlocked and trusted, Developer Mode on; run the install again. |
 

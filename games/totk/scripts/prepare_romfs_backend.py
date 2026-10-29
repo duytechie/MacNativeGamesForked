@@ -26,7 +26,7 @@ if args.aoc:
     (out/'aoc-config.txt').write_text(f'AOC_PRESENT_MASK {sum(1<<(i-1) for i in present)}\n'+''.join(lines))
     print(json.dumps({'aoc_present':present}));raise SystemExit
 folder=root/f'extracted/{version}/romfs';manifest=json.loads((folder/'index.json').read_text())
-assert manifest['status']=='pass' and (folder/'romfs.bin').stat().st_size==manifest['romfs_size']
+assert manifest['status'] in ('pass', 'unverified') and (folder/'romfs.bin').stat().st_size==manifest['romfs_size']
 strings=bytearray();rows=bytearray()
 for item in manifest['files']:
     name=item['path'].encode()+b'\0';rows.extend(struct.pack('<QQII',item['offset'],item['size'],len(strings),len(name)));strings.extend(name)
